@@ -6,9 +6,8 @@
 import os
 import uuid
 import threading
-import time
+import tempfile
 from flask import Flask, request, jsonify, send_file, render_template
-import io
 
 from motor import procesar_zip, generar_excel
 
@@ -48,12 +47,13 @@ def procesar():
         "estado":    "procesando",
         "progreso":  0,
         "total":     0,
-        "resultado": None,
+        "archivo":   None,   # ruta al archivo temporal en disco
         "error":     None,
         "stats":     None,
     }
 
     def run():
+        tmp_path = None
         try:
             def cb(done, total):
                 JOBS[job_id]["progreso"] = done
@@ -62,16 +62,29 @@ def procesar():
             facturas, omitidos, sin_catalogo = procesar_zip(zip_bytes, num_pol, cb)
             excel_bytes = generar_excel(facturas, num_pol)
 
-            JOBS[job_id]["resultado"] = excel_bytes
-            JOBS[job_id]["stats"]     = {
+            # Guardar en archivo temporal en disco (sobrevive entre requests)
+            tmp = tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=".xlsx",
+                prefix=f"job_{job_id}_"
+            )
+            tmp.write(excel_bytes)
+            tmp.close()
+            tmp_path = tmp.name
+
+            JOBS[job_id]["archivo"] = tmp_path
+            JOBS[job_id]["stats"]   = {
                 "procesadas":    len(facturas),
                 "omitidas":      len(omitidos),
                 "sin_catalogo":  len(sin_catalogo),
                 "polizas_desde": num_pol,
-                "polizas_hasta": num_pol + len(facturas) - 1,
+                "polizas_hasta": num_pol + len(facturas) - 1 if facturas else num_pol,
             }
             JOBS[job_id]["estado"] = "listo"
+
         except Exception as e:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
             JOBS[job_id]["estado"] = "error"
             JOBS[job_id]["error"]  = str(e)
 
@@ -99,9 +112,12 @@ def descargar(job_id):
     if not job or job["estado"] != "listo":
         return jsonify({"error": "Resultado no disponible"}), 404
 
-    excel_bytes = job["resultado"]
+    ruta = job.get("archivo")
+    if not ruta or not os.path.exists(ruta):
+        return jsonify({"error": "Archivo temporal no encontrado. Vuelve a procesar."}), 404
+
     return send_file(
-        io.BytesIO(excel_bytes),
+        ruta,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         as_attachment=True,
         download_name="Polizas_Provision_Ingresos.xlsx",
